@@ -27,7 +27,7 @@ Everything lives in `src/edupage_mcp/server.py` (~1450 lines). The module entry 
 
 ### Key patterns:
 
-- **Session singleton**: `_session` holds a single `edupage_api.Edupage` instance. `_try_env_login()` attempts auto-login at startup from env vars. Tools call `_get_session()` which raises if not logged in.
+- **Multi-school sessions**: `_sessions` dict (keyed by subdomain) holds one `edupage_api.Edupage` instance per school. Supports comma-separated `EDUPAGE_SUBDOMAIN` for multi-school login with the same credentials. `_get_session(school)` returns a specific session (or the only one if single-school). `_for_all_sessions(fn, school)` runs a function across all sessions and merges results, tagging each with a `school` field in multi-school mode. `_resolve_student_across_sessions()` auto-detects which school a student belongs to.
 
 - **Lean serializers**: Every entity type (lesson, grade, student, teacher, class, classroom, subject, timeline event) has a `_lean_*()` function that extracts only the useful fields from edupage-api dataclasses. This reduces response size by ~90% vs raw `__dict__` dumps. There's also a generic `_serialize()` fallback.
 
@@ -37,13 +37,13 @@ Everything lives in `src/edupage_mcp/server.py` (~1450 lines). The module entry 
 
 - **Event categories**: `_EVENT_CATEGORIES` maps human-friendly names (homework, grades, exams, messages, absences, events, news) to raw Edupage event type values. Used by the `category` parameter on timeline tools.
 
-- **Student resolution**: `_resolve_student()` does case-insensitive exact match then substring match. `_resolve_class_for_student()` chains this with class lookup. Used by timetable, absence, and summary tools.
+- **Student resolution**: `_resolve_student()` does case-insensitive exact match then substring match. `_resolve_class_for_student()` chains this with class lookup. Cross-session variants (`_resolve_student_across_sessions`, `_resolve_class_for_student_across_sessions`) search all connected schools and auto-detect the correct one. Used by timetable, absence, and summary tools.
 
 ### Tool groups:
 
 | Group | Tools | Notes |
 |-------|-------|-------|
-| Auth | `login`, `login_auto` | Env vars preferred; sets `_session` |
+| Auth | `login`, `login_auto` | Env vars preferred; supports comma-separated subdomains |
 | Timetable | `get_timetable`, `get_next_week_timetable`, `get_timetable_changes` | Supports `student_name`, `class_name` params |
 | Grades | `get_grades` | Lean format with percent, class_avg |
 | People | `get_my_children`, `get_students`, `get_all_students`, `get_teachers` | `get_my_children` is the starting point for parent accounts |
@@ -61,4 +61,4 @@ Everything lives in `src/edupage_mcp/server.py` (~1450 lines). The module entry 
 
 ## Auth Configuration
 
-Set env vars `EDUPAGE_USERNAME`, `EDUPAGE_PASSWORD`, `EDUPAGE_SUBDOMAIN` before starting the server. The `.mcp.json` references these. The subdomain is the part before `.edupage.org`.
+Set env vars `EDUPAGE_USERNAME`, `EDUPAGE_PASSWORD`, `EDUPAGE_SUBDOMAIN` before starting the server. The `.mcp.json` references these. The subdomain is the part before `.edupage.org`. For multi-school support (same credentials, different subdomains), use comma-separated values: `EDUPAGE_SUBDOMAIN=school1,school2`.

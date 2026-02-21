@@ -39,19 +39,83 @@ def _get_edupage_api():
 
 
 # ---------------------------------------------------------------------------
-# Session management – one Edupage instance per server process.
+# Session management – supports multiple Edupage instances (multi-school).
 # ---------------------------------------------------------------------------
-_session: Any = None
+_sessions: dict[str, Any] = {}
 
 
-def _get_session():
-    """Return the current logged-in Edupage session or raise."""
-    if _session is None:
+def _get_session(school: str = "") -> Any:
+    """Return a logged-in Edupage session.
+
+    If school is specified, return that specific session.
+    If only one session exists, return it.
+    If multiple sessions exist and no school specified, raise with helpful message.
+    """
+    if not _sessions:
         raise RuntimeError(
             "Not logged in. Call the 'login' tool (no arguments needed — "
             "credentials are read from environment variables)."
         )
-    return _session
+    if school:
+        if school not in _sessions:
+            available = ", ".join(_sessions.keys())
+            raise RuntimeError(f"School '{school}' not found. Available: {available}")
+        return _sessions[school]
+    if len(_sessions) == 1:
+        return next(iter(_sessions.values()))
+    available = ", ".join(_sessions.keys())
+    raise RuntimeError(
+        f"Multiple schools connected ({available}). "
+        f"Specify the 'school' parameter."
+    )
+
+
+def _get_all_sessions() -> dict[str, Any]:
+    """Return all logged-in sessions. Raises if none."""
+    if not _sessions:
+        raise RuntimeError(
+            "Not logged in. Call the 'login' tool (no arguments needed — "
+            "credentials are read from environment variables)."
+        )
+    return _sessions
+
+
+def _is_multi_school() -> bool:
+    """Return True if more than one school is connected."""
+    return len(_sessions) > 1
+
+
+def _for_all_sessions(fn, school: str = "") -> list[dict]:
+    """Run fn(edu) for each session, tag results with 'school' if multi, return merged list.
+
+    fn takes an Edupage instance and returns list[dict].
+    In multi-school mode, adds 'school' field to each result dict.
+    If school param given, only run against that session.
+    """
+    sessions = _get_all_sessions()
+    if school:
+        if school not in sessions:
+            available = ", ".join(sessions.keys())
+            raise RuntimeError(f"School '{school}' not found. Available: {available}")
+        sessions = {school: sessions[school]}
+
+    multi = _is_multi_school() and not school
+    merged: list[dict] = []
+    errors: list[dict] = []
+    for sub, edu in sessions.items():
+        try:
+            results = fn(edu)
+            if multi:
+                for item in results:
+                    item["school"] = sub
+            merged.extend(results)
+        except Exception as e:
+            logger.warning("Error from %s: %s", sub, e)
+            errors.append({"school": sub, "error": str(e)})
+
+    if not merged and errors:
+        raise RuntimeError(f"All schools failed: {errors}")
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +501,75 @@ def _resolve_class_for_student(edu: Any, student_name: str) -> tuple[Any, Any, s
 
 
 # ---------------------------------------------------------------------------
+# Cross-session student resolution (multi-school)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_student_across_sessions(
+    student_name: str, school: str = ""
+) -> tuple[Any, Any, str]:
+    """Search all sessions for a student. Returns (edu, student, error_msg).
+
+    If school specified, only search that session.
+    If found in exactly one session, return it.
+    If found in multiple, error asking to specify school.
+    If not found, list all available students with their school.
+    """
+    sessions = _get_all_sessions()
+    if school:
+        if school not in sessions:
+            available = ", ".join(sessions.keys())
+            return None, None, f"School '{school}' not found. Available: {available}"
+        sessions = {school: sessions[school]}
+
+    found: list[tuple[str, Any, Any]] = []  # (subdomain, edu, student)
+    all_students: list[tuple[str, str]] = []  # (subdomain, student_name)
+
+    for sub, edu in sessions.items():
+        student, err = _resolve_student(edu, student_name)
+        if student:
+            found.append((sub, edu, student))
+        else:
+            try:
+                students = edu.get_students()
+                for s in students:
+                    all_students.append((sub, getattr(s, "name", "?")))
+            except Exception:
+                pass
+
+    if len(found) == 1:
+        return found[0][1], found[0][2], ""
+
+    if len(found) > 1:
+        schools = ", ".join(f[0] for f in found)
+        return None, None, (
+            f"Student '{student_name}' found in multiple schools: {schools}. "
+            f"Specify the 'school' parameter."
+        )
+
+    # Not found anywhere
+    available = ", ".join(f"{name} ({sub})" for sub, name in all_students)
+    return None, None, f"Student '{student_name}' not found. Available: {available}"
+
+
+def _resolve_class_for_student_across_sessions(
+    student_name: str, school: str = ""
+) -> tuple[Any, Any, Any, str]:
+    """Resolve student across sessions then find their Class.
+    Returns (edu, student, class_obj, error_msg).
+    """
+    edu, student, err = _resolve_student_across_sessions(student_name, school)
+    if err:
+        return None, None, None, err
+
+    _, cls, err = _resolve_class_for_student(edu, student.name)
+    if err:
+        return edu, student, None, err
+
+    return edu, student, cls, ""
+
+
+# ---------------------------------------------------------------------------
 # Homework / assignment extraction from timeline events
 # ---------------------------------------------------------------------------
 
@@ -496,6 +629,12 @@ mcp = FastMCP(
         "(EDUPAGE_USERNAME, EDUPAGE_PASSWORD, EDUPAGE_SUBDOMAIN). "
         "If not already logged in, call the 'login' tool with no arguments. "
         "Never ask the user for credentials — they must be set as env vars. "
+        "Multi-school support: EDUPAGE_SUBDOMAIN can be comma-separated "
+        "(e.g. 'school1,school2') to connect to multiple schools with the "
+        "same credentials. When multiple schools are connected, results are "
+        "merged and tagged with a 'school' field. Student-name tools "
+        "(timetable, absences, summary) auto-detect the correct school. "
+        "Use the 'school' parameter to filter results to a specific school. "
         "Tools expose timetables, grades, homework, messages, students, "
         "teachers, classes, and more. Use get_my_children() to find student "
         "names, then pass student_name to other tools for targeted lookups."
@@ -511,16 +650,17 @@ def login(username: str = "", password: str = "", subdomain: str = "") -> str:
     """
     Log in to Edupage using environment variables. No parameters needed
     if EDUPAGE_USERNAME, EDUPAGE_PASSWORD, and EDUPAGE_SUBDOMAIN are set.
+    Supports multiple schools via comma-separated subdomains.
 
     Args:
         username: Your Edupage username (defaults to EDUPAGE_USERNAME env var)
         password: Your Edupage password (defaults to EDUPAGE_PASSWORD env var)
-        subdomain: Your school's Edupage subdomain (defaults to EDUPAGE_SUBDOMAIN env var)
+        subdomain: Your school's Edupage subdomain, or comma-separated list for multi-school
+                   (defaults to EDUPAGE_SUBDOMAIN env var)
 
     Returns:
         Success or error message
     """
-    global _session
     username = username or os.environ.get("EDUPAGE_USERNAME", "")
     password = password or os.environ.get("EDUPAGE_PASSWORD", "")
     subdomain = subdomain or os.environ.get("EDUPAGE_SUBDOMAIN", "")
@@ -540,18 +680,33 @@ def login(username: str = "", password: str = "", subdomain: str = "") -> str:
             "Set them before starting the server.",
         )
 
+    subdomains = [s.strip() for s in subdomain.split(",") if s.strip()]
     api = _get_edupage_api()
-    edu = api.Edupage()
-    try:
-        edu.login(username, password, subdomain)
-    except api.exceptions.BadCredentialsException:
-        return _error("login", "Wrong username or password.", _ERROR_HINTS["BadCredentialsException"])
-    except api.exceptions.CaptchaException:
-        return _error("login", "CAPTCHA requested.", _ERROR_HINTS["CaptchaException"])
-    except Exception as e:
-        return _error("login", str(e))
-    _session = edu
-    return f"Logged in successfully on {subdomain}.edupage.org"
+    successes = []
+    failures = []
+
+    for sub in subdomains:
+        edu = api.Edupage()
+        try:
+            edu.login(username, password, sub)
+            _sessions[sub] = edu
+            successes.append(sub)
+        except api.exceptions.BadCredentialsException:
+            failures.append(f"{sub}: wrong credentials")
+        except api.exceptions.CaptchaException:
+            failures.append(f"{sub}: CAPTCHA requested")
+        except Exception as e:
+            failures.append(f"{sub}: {e}")
+
+    parts = []
+    if successes:
+        parts.append(f"Logged in: {', '.join(s + '.edupage.org' for s in successes)}")
+    if failures:
+        parts.append(f"Failed: {'; '.join(failures)}")
+
+    if not successes:
+        return _error("login", "; ".join(failures))
+    return ". ".join(parts)
 
 
 @mcp.tool()
@@ -567,7 +722,6 @@ def login_auto(username: str = "", password: str = "") -> str:
     Returns:
         Success or error message
     """
-    global _session
     username = username or os.environ.get("EDUPAGE_USERNAME", "")
     password = password or os.environ.get("EDUPAGE_PASSWORD", "")
 
@@ -591,8 +745,11 @@ def login_auto(username: str = "", password: str = "") -> str:
         edu.login_auto(username, password)
     except Exception as e:
         return _error("login_auto", str(e))
-    _session = edu
-    return "Logged in successfully via portal."
+
+    # Store under the detected subdomain
+    sub = getattr(edu, "subdomain", None) or "auto"
+    _sessions[sub] = edu
+    return f"Logged in successfully via portal ({sub}.edupage.org)."
 
 
 # ── Timetable ──────────────────────────────────────────────────────────────
@@ -600,7 +757,7 @@ def login_auto(username: str = "", password: str = "") -> str:
 
 @mcp.tool()
 @_handle_errors("get_timetable")
-def get_timetable(date_str: str = "", class_name: str = "", student_name: str = "") -> str:
+def get_timetable(date_str: str = "", class_name: str = "", student_name: str = "", school: str = "") -> str:
     """
     Get the timetable for a given date (defaults to today).
 
@@ -608,23 +765,25 @@ def get_timetable(date_str: str = "", class_name: str = "", student_name: str = 
         date_str: Date in YYYY-MM-DD format. Leave empty for today.
         class_name: Class name (e.g. '6e', '4a'). If empty, uses logged-in user's timetable.
         student_name: Student name to look up their class timetable (e.g. 'Jan Novak').
-                      Resolves the student's class automatically.
+                      Resolves the student's class automatically (searches all schools).
+        school: School subdomain (only needed with multiple schools and no student_name).
 
     Returns:
         JSON array of lean timetable lessons
     """
-    edu = _get_session()
     target_date = (
         datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else date.today()
     )
 
-    # Resolve student → class
+    # Resolve student → class (auto-detects school)
     if student_name:
-        _student, cls, err = _resolve_class_for_student(edu, student_name)
+        edu, _student, cls, err = _resolve_class_for_student_across_sessions(student_name, school)
         if err:
             return _error("get_timetable", err)
         timetable = edu.get_timetable(cls, target_date)
         return _lean_json(_lean_timetable(timetable))
+
+    edu = _get_session(school)
 
     # If a class name is specified, look it up directly
     if class_name:
@@ -676,39 +835,41 @@ def _get_timetable_by_class(edu: Any, class_name: str, target_date: date) -> str
 
 @mcp.tool()
 @_handle_errors("get_next_week_timetable")
-def get_next_week_timetable(class_name: str = "", student_name: str = "") -> str:
+def get_next_week_timetable(class_name: str = "", student_name: str = "", school: str = "") -> str:
     """
     Get timetable for each day of the upcoming week (Mon-Fri).
 
     Args:
         class_name: Class name (e.g. '6e', '4a'). If empty, uses logged-in user's timetable.
-        student_name: Student name to look up their class timetable.
+        student_name: Student name to look up their class timetable (searches all schools).
+        school: School subdomain (only needed with multiple schools and no student_name).
 
     Returns:
         JSON object keyed by date with lean timetable lessons
     """
-    edu = _get_session()
     today = date.today()
     days_until_monday = (7 - today.weekday()) % 7 or 7
     monday = today + timedelta(days=days_until_monday)
 
-    # Resolve target class
+    # Resolve target class (auto-detects school)
     target_class = None
     if student_name:
-        _student, cls, err = _resolve_class_for_student(edu, student_name)
+        edu, _student, cls, err = _resolve_class_for_student_across_sessions(student_name, school)
         if err:
             return _error("get_next_week_timetable", err)
         target_class = cls
-    elif class_name:
-        classes = edu.get_classes()
-        matched = [c for c in classes if c.name.lower() == class_name.lower()]
-        if not matched:
-            available = ", ".join(sorted(c.name for c in classes))
-            return _error(
-                "get_next_week_timetable", f"Class '{class_name}' not found.",
-                f"Available classes: {available}",
-            )
-        target_class = matched[0]
+    else:
+        edu = _get_session(school)
+        if class_name:
+            classes = edu.get_classes()
+            matched = [c for c in classes if c.name.lower() == class_name.lower()]
+            if not matched:
+                available = ", ".join(sorted(c.name for c in classes))
+                return _error(
+                    "get_next_week_timetable", f"Class '{class_name}' not found.",
+                    f"Available classes: {available}",
+                )
+            target_class = matched[0]
 
     result = {}
     for i in range(5):
@@ -727,22 +888,26 @@ def get_next_week_timetable(class_name: str = "", student_name: str = "") -> str
 
 @mcp.tool()
 @_handle_errors("get_timetable_changes")
-def get_timetable_changes(date_str: str = "") -> str:
+def get_timetable_changes(date_str: str = "", school: str = "") -> str:
     """
     Get timetable changes / substitutions for a date (defaults to today).
 
     Args:
         date_str: Date in YYYY-MM-DD format. Leave empty for today.
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of timetable changes
     """
-    edu = _get_session()
     target_date = (
         datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else date.today()
     )
-    changes = edu.get_timetable_changes(target_date)
-    return _json(changes)
+
+    def _fetch(edu):
+        changes = edu.get_timetable_changes(target_date)
+        return [_serialize(c) for c in changes]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 # ── Grades ─────────────────────────────────────────────────────────────────
@@ -750,7 +915,7 @@ def get_timetable_changes(date_str: str = "") -> str:
 
 @mcp.tool()
 @_handle_errors("get_grades")
-def get_grades(term: str = "", year: int = 0) -> str:
+def get_grades(term: str = "", year: int = 0, school: str = "") -> str:
     """
     Get student grades/marks. Returns grades for the current session's child.
     For parent accounts with multiple children, grades are for the child linked
@@ -759,18 +924,21 @@ def get_grades(term: str = "", year: int = 0) -> str:
     Args:
         term: Term/semester filter (leave empty for all)
         year: School year filter (leave 0 for current)
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean grade records with percent, class_avg, etc.
     """
-    edu = _get_session()
     kwargs: dict[str, Any] = {}
     if term:
         kwargs["term"] = term
     if year:
         kwargs["year"] = year
-    grades = edu.get_grades(**kwargs)
-    return _lean_json([_lean_grade(g) for g in grades])
+
+    def _fetch(edu):
+        return [_lean_grade(g) for g in edu.get_grades(**kwargs)]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 # ── Students & Teachers ───────────────────────────────────────────────────
@@ -778,65 +946,83 @@ def get_grades(term: str = "", year: int = 0) -> str:
 
 @mcp.tool()
 @_handle_errors("get_my_children")
-def get_my_children() -> str:
+def get_my_children(school: str = "") -> str:
     """
     Get your children (for parent accounts) or classmates (for student accounts).
     Use this to find student names for use with other tools like get_timetable,
     get_absences, and get_student_summary.
 
+    Args:
+        school: School subdomain (only needed with multiple schools).
+
     Returns:
         JSON array of students with person_id, name, class_id, number
     """
-    edu = _get_session()
-    students = edu.get_students()
-    return _lean_json([_lean_student(s) for s in students])
+    def _fetch(edu):
+        return [_lean_student(s) for s in edu.get_students()]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 @mcp.tool()
 @_handle_errors("get_students")
-def get_students() -> str:
+def get_students(school: str = "") -> str:
     """
     Get students in your class.
+
+    Args:
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean student records
     """
-    edu = _get_session()
-    return _lean_json([_lean_student(s) for s in edu.get_students()])
+    def _fetch(edu):
+        return [_lean_student(s) for s in edu.get_students()]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 @mcp.tool()
 @_handle_errors("get_all_students")
-def get_all_students() -> str:
+def get_all_students(school: str = "") -> str:
     """
     Get all students in the school (name + class only).
+
+    Args:
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of student skeletons
     """
-    edu = _get_session()
-    students = edu.get_all_students()
-    result = []
-    for s in students:
-        result.append({
-            "person_id": getattr(s, "person_id", None),
-            "name": getattr(s, "name_short", None) or getattr(s, "name", None),
-            "class_id": getattr(s, "class_id", None),
-        })
-    return _lean_json(result)
+    def _fetch(edu):
+        result = []
+        for s in edu.get_all_students():
+            result.append({
+                "person_id": getattr(s, "person_id", None),
+                "name": getattr(s, "name_short", None) or getattr(s, "name", None),
+                "class_id": getattr(s, "class_id", None),
+            })
+        return result
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 @mcp.tool()
 @_handle_errors("get_teachers")
-def get_teachers() -> str:
+def get_teachers(school: str = "") -> str:
     """
     Get all teachers in the school.
+
+    Args:
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean teacher records
     """
-    edu = _get_session()
-    return _lean_json([_lean_teacher(t) for t in edu.get_teachers()])
+    def _fetch(edu):
+        return [_lean_teacher(t) for t in edu.get_teachers()]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 # ── Classes & Classrooms ──────────────────────────────────────────────────
@@ -844,28 +1030,38 @@ def get_teachers() -> str:
 
 @mcp.tool()
 @_handle_errors("get_classes")
-def get_classes() -> str:
+def get_classes(school: str = "") -> str:
     """
     Get all classes in the school.
+
+    Args:
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean class records
     """
-    edu = _get_session()
-    return _lean_json([_lean_class(c) for c in edu.get_classes()])
+    def _fetch(edu):
+        return [_lean_class(c) for c in edu.get_classes()]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 @mcp.tool()
 @_handle_errors("get_classrooms")
-def get_classrooms() -> str:
+def get_classrooms(school: str = "") -> str:
     """
     Get all classrooms in the school.
+
+    Args:
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean classroom records
     """
-    edu = _get_session()
-    return _lean_json([_lean_classroom(r) for r in edu.get_classrooms()])
+    def _fetch(edu):
+        return [_lean_classroom(r) for r in edu.get_classrooms()]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 # ── Homework & Assignments ────────────────────────────────────────────────
@@ -873,7 +1069,7 @@ def get_classrooms() -> str:
 
 @mcp.tool()
 @_handle_errors("get_homework")
-def get_homework(since_days: int = 30, status: str = "") -> str:
+def get_homework(since_days: int = 30, status: str = "", school: str = "") -> str:
     """
     Get homework assignments from the last N days.
     Extracts homework from the timeline/notification history.
@@ -881,25 +1077,29 @@ def get_homework(since_days: int = 30, status: str = "") -> str:
     Args:
         since_days: How many days back to search (default 30)
         status: Filter by status — "active" (not done), "done", or "" (all, default)
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of homework items with title, subject, due_date, etc.
     """
-    edu = _get_session()
     since = date.today() - timedelta(days=since_days)
-    events = edu.get_notification_history(since)
-    events = _filter_timeline_events(
-        events,
-        event_type="homework,etesthw",
-        status=status,
-        limit=200,
-    )
-    return _lean_json([_extract_homework_fields(e) for e in events])
+
+    def _fetch(edu):
+        events = edu.get_notification_history(since)
+        events_filtered = _filter_timeline_events(
+            events,
+            event_type="homework,etesthw",
+            status=status,
+            limit=200,
+        )
+        return [_extract_homework_fields(e) for e in events_filtered]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 @mcp.tool()
 @_handle_errors("get_assignments")
-def get_assignments(since_days: int = 30, status: str = "", event_type: str = "") -> str:
+def get_assignments(since_days: int = 30, status: str = "", event_type: str = "", school: str = "") -> str:
     """
     Get all assignments (homework, tests, exams, projects, etc.) from the last N days.
 
@@ -908,21 +1108,25 @@ def get_assignments(since_days: int = 30, status: str = "", event_type: str = ""
         status: Filter by status — "active", "done", or "" (all, default)
         event_type: Narrow to specific types (comma-separated). Valid types:
                     homework, etesthw, bexam, sexam, oexam, rexam, pexam, testing
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of assignment items
     """
-    edu = _get_session()
     since = date.today() - timedelta(days=since_days)
-    events = edu.get_notification_history(since)
     types = event_type or "homework,etesthw,bexam,sexam,oexam,rexam,pexam,testing"
-    events = _filter_timeline_events(
-        events,
-        event_type=types,
-        status=status,
-        limit=200,
-    )
-    return _lean_json([_extract_assignment_fields(e) for e in events])
+
+    def _fetch(edu):
+        events = edu.get_notification_history(since)
+        events_filtered = _filter_timeline_events(
+            events,
+            event_type=types,
+            status=status,
+            limit=200,
+        )
+        return [_extract_assignment_fields(e) for e in events_filtered]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 # ── Timeline & Notifications ─────────────────────────────────────────────
@@ -940,6 +1144,7 @@ def get_timeline(
     limit: int = 50,
     offset: int = 0,
     include_system: bool = False,
+    school: str = "",
 ) -> str:
     """
     Get the visible timeline (recent messages, assignments, grades).
@@ -956,25 +1161,28 @@ def get_timeline(
         limit: Max items to return (default 50).
         offset: Items to skip for pagination.
         include_system: Include system events like H_* types (default false).
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean timeline events
     """
-    edu = _get_session()
-    events = edu.get_notifications()
-    events = _filter_timeline_events(
-        events,
-        include_system=include_system,
-        status="" if status == "all" else status,
-        starred=starred,
-        event_type=event_type,
-        category=category,
-        date_from=date_from,
-        date_to=date_to,
-        limit=limit,
-        offset=offset,
-    )
-    return _lean_json([_lean_timeline_event(e) for e in events])
+    def _fetch(edu):
+        events = edu.get_notifications()
+        events_filtered = _filter_timeline_events(
+            events,
+            include_system=include_system,
+            status="" if status == "all" else status,
+            starred=starred,
+            event_type=event_type,
+            category=category,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
+        return [_lean_timeline_event(e) for e in events_filtered]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 @mcp.tool()
@@ -987,6 +1195,7 @@ def get_notifications(
     limit: int = 50,
     offset: int = 0,
     include_system: bool = False,
+    school: str = "",
 ) -> str:
     """
     Get recent notifications. System events are hidden by default.
@@ -999,23 +1208,26 @@ def get_notifications(
         limit: Max items (default 50).
         offset: Skip items for pagination.
         include_system: Include system events (default false).
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean notification events
     """
-    edu = _get_session()
-    events = edu.get_notifications()
-    events = _filter_timeline_events(
-        events,
-        include_system=include_system,
-        status=status,
-        starred=starred,
-        event_type=event_type,
-        category=category,
-        limit=limit,
-        offset=offset,
-    )
-    return _lean_json([_lean_timeline_event(e) for e in events])
+    def _fetch(edu):
+        events = edu.get_notifications()
+        events_filtered = _filter_timeline_events(
+            events,
+            include_system=include_system,
+            status=status,
+            starred=starred,
+            event_type=event_type,
+            category=category,
+            limit=limit,
+            offset=offset,
+        )
+        return [_lean_timeline_event(e) for e in events_filtered]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 @mcp.tool()
@@ -1029,6 +1241,7 @@ def get_notification_history(
     limit: int = 50,
     offset: int = 0,
     include_system: bool = False,
+    school: str = "",
 ) -> str:
     """
     Get notification history since a given date.
@@ -1042,24 +1255,28 @@ def get_notification_history(
         limit: Max items (default 50).
         offset: Skip items for pagination.
         include_system: Include system events (default false).
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean notification events
     """
-    edu = _get_session()
     dt = datetime.strptime(since_date, "%Y-%m-%d").date() if since_date else date.today() - timedelta(days=7)
-    events = edu.get_notification_history(dt)
-    events = _filter_timeline_events(
-        events,
-        include_system=include_system,
-        status=status,
-        starred=starred,
-        event_type=event_type,
-        category=category,
-        limit=limit,
-        offset=offset,
-    )
-    return _lean_json([_lean_timeline_event(e) for e in events])
+
+    def _fetch(edu):
+        events = edu.get_notification_history(dt)
+        events_filtered = _filter_timeline_events(
+            events,
+            include_system=include_system,
+            status=status,
+            starred=starred,
+            event_type=event_type,
+            category=category,
+            limit=limit,
+            offset=offset,
+        )
+        return [_lean_timeline_event(e) for e in events_filtered]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 # ── News ──────────────────────────────────────────────────────────────────
@@ -1067,15 +1284,21 @@ def get_notification_history(
 
 @mcp.tool()
 @_handle_errors("get_news")
-def get_news() -> str:
+def get_news(school: str = "") -> str:
     """
     Get school news from the Edupage webpage.
+
+    Args:
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of news items
     """
-    edu = _get_session()
-    return _json(edu.get_news())
+    def _fetch(edu):
+        news = edu.get_news()
+        return [_serialize(n) for n in news]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 # ── Meals ─────────────────────────────────────────────────────────────────
@@ -1083,44 +1306,70 @@ def get_news() -> str:
 
 @mcp.tool()
 @_handle_errors("get_meals")
-def get_meals(date_str: str = "") -> str:
+def get_meals(date_str: str = "", school: str = "") -> str:
     """
     Get school meal information for a given date (defaults to today).
 
     Args:
         date_str: Date in YYYY-MM-DD format. Leave empty for today.
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON of meal data (snack, lunch, afternoon_snack)
     """
-    edu = _get_session()
     target_date = (
         datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else date.today()
     )
-    meals = edu.get_meals(target_date)
-    if meals is None:
-        return _lean_json({"message": "No meal data available for this date."})
-    result = {}
-    for slot in ("snack", "lunch", "afternoon_snack"):
-        meal = getattr(meals, slot, None)
-        if meal:
-            result[slot] = {
-                "title": getattr(meal, "title", None),
-                "date": meal.date.isoformat() if getattr(meal, "date", None) else None,
-                "served_from": meal.served_from.isoformat() if getattr(meal, "served_from", None) else None,
-                "served_to": meal.served_to.isoformat() if getattr(meal, "served_to", None) else None,
-                "ordered_meal": getattr(meal, "ordered_meal", None),
-                "menus": [
-                    {
-                        "name": getattr(m, "name", None),
-                        "allergens": getattr(m, "allergens", None),
-                        "weight": getattr(m, "weight", None),
-                        "number": getattr(m, "number", None),
-                    }
-                    for m in (meal.menus or [])
-                ],
-            }
-    return _lean_json(result)
+
+    def _fetch_meals(edu):
+        meals = edu.get_meals(target_date)
+        if meals is None:
+            return {}
+        result = {}
+        for slot in ("snack", "lunch", "afternoon_snack"):
+            meal = getattr(meals, slot, None)
+            if meal:
+                result[slot] = {
+                    "title": getattr(meal, "title", None),
+                    "date": meal.date.isoformat() if getattr(meal, "date", None) else None,
+                    "served_from": meal.served_from.isoformat() if getattr(meal, "served_from", None) else None,
+                    "served_to": meal.served_to.isoformat() if getattr(meal, "served_to", None) else None,
+                    "ordered_meal": getattr(meal, "ordered_meal", None),
+                    "menus": [
+                        {
+                            "name": getattr(m, "name", None),
+                            "allergens": getattr(m, "allergens", None),
+                            "weight": getattr(m, "weight", None),
+                            "number": getattr(m, "number", None),
+                        }
+                        for m in (meal.menus or [])
+                    ],
+                }
+        return result
+
+    sessions = _get_all_sessions()
+    if school:
+        if school not in sessions:
+            available = ", ".join(sessions.keys())
+            return _error("get_meals", f"School '{school}' not found. Available: {available}")
+        sessions = {school: sessions[school]}
+
+    if len(sessions) == 1:
+        edu = next(iter(sessions.values()))
+        result = _fetch_meals(edu)
+        if not result:
+            return _lean_json({"message": "No meal data available for this date."})
+        return _lean_json(result)
+
+    # Multi-school: nest under school keys
+    combined = {}
+    for sub, edu in sessions.items():
+        try:
+            result = _fetch_meals(edu)
+            combined[sub] = result or {"message": "No meal data available for this date."}
+        except Exception as e:
+            combined[sub] = {"error": str(e)}
+    return _lean_json(combined)
 
 
 # ── Messaging ─────────────────────────────────────────────────────────────
@@ -1128,7 +1377,7 @@ def get_meals(date_str: str = "") -> str:
 
 @mcp.tool()
 @_handle_errors("send_message")
-def send_message(recipients: str, body: str) -> str:
+def send_message(recipients: str, body: str, school: str = "") -> str:
     """
     Send a message to one or more Edupage users.
     ⚠️  Use with care – this sends real messages.
@@ -1136,44 +1385,81 @@ def send_message(recipients: str, body: str) -> str:
     Args:
         recipients: Comma-separated list of recipient names (must match teacher/student names exactly)
         body: The message text to send
+        school: School subdomain (required when recipient exists in multiple schools).
 
     Returns:
         Success or error message
     """
-    edu = _get_session()
+    sessions = _get_all_sessions()
+    if school:
+        if school not in sessions:
+            available = ", ".join(sessions.keys())
+            return _error("send_message", f"School '{school}' not found. Available: {available}")
+        sessions = {school: sessions[school]}
+
     recipient_names = [r.strip() for r in recipients.split(",")]
 
-    all_people: list[Any] = []
-    try:
-        all_people.extend(edu.get_teachers())
-    except Exception:
-        pass
-    try:
-        all_people.extend(edu.get_students())
-    except Exception:
-        pass
-
-    matched = []
-    not_found = []
-    for name in recipient_names:
-        found = False
+    # Build a people index: name → [(subdomain, edu, person)]
+    people_index: dict[str, list[tuple[str, Any, Any]]] = {}
+    for sub, edu in sessions.items():
+        all_people: list[Any] = []
+        try:
+            all_people.extend(edu.get_teachers())
+        except Exception:
+            pass
+        try:
+            all_people.extend(edu.get_students())
+        except Exception:
+            pass
         for person in all_people:
             full_name = getattr(person, "name", "") or ""
-            if name.lower() in full_name.lower():
-                matched.append(person)
-                found = True
-                break
-        if not found:
+            people_index.setdefault(full_name.lower(), []).append((sub, edu, person))
+
+    # Resolve each recipient
+    matched: list[tuple[str, Any, Any]] = []  # (subdomain, edu, person)
+    not_found = []
+    ambiguous = []
+    for name in recipient_names:
+        name_lower = name.lower()
+        candidates = []
+        for key, entries in people_index.items():
+            if name_lower in key:
+                candidates.extend(entries)
+        if not candidates:
             not_found.append(name)
+        elif len(candidates) == 1:
+            matched.append(candidates[0])
+        else:
+            # Check if all candidates are from the same school
+            schools_found = {c[0] for c in candidates}
+            if len(schools_found) == 1:
+                matched.append(candidates[0])
+            else:
+                ambiguous.append(f"{name} (found in: {', '.join(schools_found)})")
 
     if not_found:
         return _error("send_message", f"Could not find recipients: {', '.join(not_found)}")
+    if ambiguous:
+        return _error(
+            "send_message",
+            f"Ambiguous recipients: {'; '.join(ambiguous)}. Specify the 'school' parameter.",
+        )
     if not matched:
         return _error("send_message", "No recipients matched.")
 
-    edu.send_message(matched, body)
-    names = [getattr(p, "name", str(p)) for p in matched]
-    return f"Message sent to: {', '.join(names)}"
+    # Group by session and send
+    by_session: dict[str, tuple[Any, list[Any]]] = {}
+    for sub, edu, person in matched:
+        if sub not in by_session:
+            by_session[sub] = (edu, [])
+        by_session[sub][1].append(person)
+
+    sent_names = []
+    for sub, (edu, people) in by_session.items():
+        edu.send_message(people, body)
+        sent_names.extend(getattr(p, "name", str(p)) for p in people)
+
+    return f"Message sent to: {', '.join(sent_names)}"
 
 
 # ── Absences ──────────────────────────────────────────────────────────────
@@ -1181,45 +1467,71 @@ def send_message(recipients: str, body: str) -> str:
 
 @mcp.tool()
 @_handle_errors("get_absences")
-def get_absences(since_days: int = 30, student_name: str = "") -> str:
+def get_absences(since_days: int = 30, student_name: str = "", school: str = "") -> str:
     """
     Get absence records from the last N days.
 
     Args:
         since_days: How many days back to search (default 30)
-        student_name: Optional student name to validate context (e.g. 'Jan Novak')
+        student_name: Optional student name to validate context (e.g. 'Jan Novak').
+                      Searches all schools automatically.
+        school: School subdomain (only needed with multiple schools and no student_name).
 
     Returns:
         JSON array of absence records with date, type, text, author
     """
-    edu = _get_session()
-
+    # If student_name given, auto-detect school
     if student_name:
-        _student, err = _resolve_student(edu, student_name)
+        edu, _student, err = _resolve_student_across_sessions(student_name, school)
         if err:
             return _error("get_absences", err)
+        # Use single session for this student
+        since = date.today() - timedelta(days=since_days)
+        events = edu.get_notification_history(since)
+        events = _filter_timeline_events(
+            events,
+            event_type="student_absent,ospravedlnenka",
+            limit=200,
+        )
+        result = []
+        for e in events:
+            et = getattr(e, "event_type", None)
+            type_val = et.value if hasattr(et, "value") else str(et) if et else ""
+            author = getattr(e, "author", None)
+            author_name = author.name if hasattr(author, "name") else str(author) if author else None
+            result.append({
+                "date": e.timestamp.isoformat() if getattr(e, "timestamp", None) else None,
+                "type": "excused" if type_val == "ospravedlnenka" else "absent",
+                "text": getattr(e, "text", None),
+                "author": author_name,
+            })
+        return _lean_json(result)
 
+    # No student_name: merge from all sessions
     since = date.today() - timedelta(days=since_days)
-    events = edu.get_notification_history(since)
-    events = _filter_timeline_events(
-        events,
-        event_type="student_absent,ospravedlnenka",
-        limit=200,
-    )
 
-    result = []
-    for e in events:
-        et = getattr(e, "event_type", None)
-        type_val = et.value if hasattr(et, "value") else str(et) if et else ""
-        author = getattr(e, "author", None)
-        author_name = author.name if hasattr(author, "name") else str(author) if author else None
-        result.append({
-            "date": e.timestamp.isoformat() if getattr(e, "timestamp", None) else None,
-            "type": "excused" if type_val == "ospravedlnenka" else "absent",
-            "text": getattr(e, "text", None),
-            "author": author_name,
-        })
-    return _lean_json(result)
+    def _fetch(edu):
+        events = edu.get_notification_history(since)
+        events_filtered = _filter_timeline_events(
+            events,
+            event_type="student_absent,ospravedlnenka",
+            limit=200,
+        )
+        result = []
+        for e in events_filtered:
+            et = getattr(e, "event_type", None)
+            type_val = et.value if hasattr(et, "value") else str(et) if et else ""
+            author = getattr(e, "author", None)
+            author_name = author.name if hasattr(author, "name") else str(author) if author else None
+            result.append({
+                "date": e.timestamp.isoformat() if getattr(e, "timestamp", None) else None,
+                "type": "excused" if type_val == "ospravedlnenka" else "absent",
+                "text": getattr(e, "text", None),
+                "author": author_name,
+            })
+        return result
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 # ── Upcoming Events ──────────────────────────────────────────────────────
@@ -1227,55 +1539,54 @@ def get_absences(since_days: int = 30, student_name: str = "") -> str:
 
 @mcp.tool()
 @_handle_errors("get_upcoming_events")
-def get_upcoming_events(days_ahead: int = 30) -> str:
+def get_upcoming_events(days_ahead: int = 30, school: str = "") -> str:
     """
     Get upcoming events and exams within the next N days.
 
     Args:
         days_ahead: How many days ahead to look (default 30)
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of upcoming events sorted by date (nearest first)
     """
-    edu = _get_session()
     now = datetime.now()
     cutoff = now + timedelta(days=days_ahead)
-
-    # Fetch recent + upcoming from notification history
-    since = date.today() - timedelta(days=7)  # include recently created future events
-    events = edu.get_notification_history(since)
+    since = date.today() - timedelta(days=7)
 
     event_types = (
         "event,schoolevent,excursion,trip,culture,parentsevening,meeting,bmeeting,"
         "bexam,sexam,oexam,rexam,pexam,testing"
     )
-    events = _filter_timeline_events(
-        events,
-        event_type=event_types,
-        limit=500,
-    )
 
-    # Keep only future events
-    upcoming = []
-    for e in events:
-        ts = getattr(e, "timestamp", None)
-        if ts and ts >= now and ts <= cutoff:
-            ad = getattr(e, "additional_data", {}) or {}
-            et = getattr(e, "event_type", None)
-            type_val = et.value if hasattr(et, "value") else str(et) if et else None
-            title = ad.get("nazov") or ad.get("title") or getattr(e, "text", "")
-            upcoming.append({
-                "event_id": getattr(e, "event_id", None),
-                "type": type_val,
-                "date": ts.isoformat(),
-                "title": title,
-                "text": getattr(e, "text", None),
-                "is_done": getattr(e, "is_done", False),
-            })
+    def _fetch(edu):
+        events = edu.get_notification_history(since)
+        events_filtered = _filter_timeline_events(
+            events,
+            event_type=event_types,
+            limit=500,
+        )
+        upcoming = []
+        for e in events_filtered:
+            ts = getattr(e, "timestamp", None)
+            if ts and ts >= now and ts <= cutoff:
+                ad = getattr(e, "additional_data", {}) or {}
+                et = getattr(e, "event_type", None)
+                type_val = et.value if hasattr(et, "value") else str(et) if et else None
+                title = ad.get("nazov") or ad.get("title") or getattr(e, "text", "")
+                upcoming.append({
+                    "event_id": getattr(e, "event_id", None),
+                    "type": type_val,
+                    "date": ts.isoformat(),
+                    "title": title,
+                    "text": getattr(e, "text", None),
+                    "is_done": getattr(e, "is_done", False),
+                })
+        return upcoming
 
-    # Sort nearest first
-    upcoming.sort(key=lambda x: x["date"])
-    return _lean_json(upcoming)
+    result = _for_all_sessions(_fetch, school)
+    result.sort(key=lambda x: x.get("date", ""))
+    return _lean_json(result)
 
 
 # ── Student Summary ──────────────────────────────────────────────────────
@@ -1283,29 +1594,31 @@ def get_upcoming_events(days_ahead: int = 30) -> str:
 
 @mcp.tool()
 @_handle_errors("get_student_summary")
-def get_student_summary(student_name: str = "", since_days: int = 14) -> str:
+def get_student_summary(student_name: str = "", since_days: int = 14, school: str = "") -> str:
     """
     Get a comprehensive summary for a student: grades, homework, exams,
     absences, and messages — all in one call.
 
     Args:
         student_name: Student name (e.g. 'Jan Novak'). Use get_my_children() to find names.
+                      Searches all schools automatically.
         since_days: How many days back to include (default 14)
+        school: School subdomain (only needed when student exists in multiple schools).
 
     Returns:
         JSON object with student, class, grades, homework, exams, absences, messages
     """
-    edu = _get_session()
-
     student_info = None
     class_info = None
 
     if student_name:
-        student, cls, err = _resolve_class_for_student(edu, student_name)
+        edu, student, cls, err = _resolve_class_for_student_across_sessions(student_name, school)
         if err:
             return _error("get_student_summary", err)
         student_info = _lean_student(student)
         class_info = _lean_class(cls) if cls else None
+    else:
+        edu = _get_session(school)
 
     # Fetch notification history once
     since = date.today() - timedelta(days=since_days)
@@ -1364,60 +1677,90 @@ def get_student_summary(student_name: str = "", since_days: int = 14) -> str:
 
 @mcp.tool()
 @_handle_errors("get_subjects")
-def get_subjects() -> str:
+def get_subjects(school: str = "") -> str:
     """
     Get all subjects taught at the school.
+
+    Args:
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of lean subject records
     """
-    edu = _get_session()
-    return _lean_json([_lean_subject(s) for s in edu.get_subjects()])
+    def _fetch(edu):
+        return [_lean_subject(s) for s in edu.get_subjects()]
+
+    return _lean_json(_for_all_sessions(_fetch, school))
 
 
 @mcp.tool()
 @_handle_errors("get_periods")
-def get_periods() -> str:
+def get_periods(school: str = "") -> str:
     """
     Get school period / bell schedule information.
+
+    Args:
+        school: School subdomain (only needed with multiple schools).
 
     Returns:
         JSON array of periods with start/end times
     """
-    edu = _get_session()
+    def _fetch_periods(edu):
+        # Try the ringing times from session data
+        zvonenia = None
+        if hasattr(edu, "data") and isinstance(edu.data, dict):
+            zvonenia = edu.data.get("zvonenia")
 
-    # Try the ringing times from session data
-    zvonenia = None
-    if hasattr(edu, "data") and isinstance(edu.data, dict):
-        zvonenia = edu.data.get("zvonenia")
+        if zvonenia and isinstance(zvonenia, list):
+            periods = []
+            for i, item in enumerate(zvonenia):
+                if isinstance(item, dict):
+                    periods.append({
+                        "period": i + 1,
+                        "start": item.get("starttime", ""),
+                        "end": item.get("endtime", ""),
+                    })
+            if periods:
+                return periods
 
-    if zvonenia and isinstance(zvonenia, list):
-        periods = []
-        for i, item in enumerate(zvonenia):
-            if isinstance(item, dict):
-                periods.append({
-                    "period": i + 1,
-                    "start": item.get("starttime", ""),
-                    "end": item.get("endtime", ""),
-                })
-        if periods:
-            return _lean_json(periods)
+        # Fallback: try the ringing API if available
+        try:
+            ringing = edu.get_ringing_times()
+            if ringing:
+                result = []
+                for r in ringing:
+                    result.append({
+                        "type": r.type.value if hasattr(r.type, "value") else str(r.type),
+                        "time": r.time.strftime("%H:%M") if getattr(r, "time", None) else None,
+                    })
+                return result
+        except Exception:
+            pass
+        return None
 
-    # Fallback: try the ringing API if available
-    try:
-        ringing = edu.get_ringing_times()
-        if ringing:
-            result = []
-            for r in ringing:
-                result.append({
-                    "type": r.type.value if hasattr(r.type, "value") else str(r.type),
-                    "time": r.time.strftime("%H:%M") if getattr(r, "time", None) else None,
-                })
+    sessions = _get_all_sessions()
+    if school:
+        if school not in sessions:
+            available = ", ".join(sessions.keys())
+            return _error("get_periods", f"School '{school}' not found. Available: {available}")
+        sessions = {school: sessions[school]}
+
+    if len(sessions) == 1:
+        edu = next(iter(sessions.values()))
+        result = _fetch_periods(edu)
+        if result:
             return _lean_json(result)
-    except Exception:
-        pass
+        return _error("get_periods", "Bell schedule data not available.", "The school may not have published period times.")
 
-    return _error("get_periods", "Bell schedule data not available.", "The school may not have published period times.")
+    # Multi-school: nest under school keys
+    combined = {}
+    for sub, edu in sessions.items():
+        try:
+            result = _fetch_periods(edu)
+            combined[sub] = result or {"message": "Bell schedule data not available."}
+        except Exception as e:
+            combined[sub] = {"error": str(e)}
+    return _lean_json(combined)
 
 
 # ---------------------------------------------------------------------------
@@ -1426,28 +1769,33 @@ def get_periods() -> str:
 
 
 def _try_env_login():
-    """Attempt to log in using environment variables at startup."""
-    global _session
+    """Attempt to log in using environment variables at startup.
+
+    Supports comma-separated EDUPAGE_SUBDOMAIN for multi-school login.
+    """
     username = os.environ.get("EDUPAGE_USERNAME")
     password = os.environ.get("EDUPAGE_PASSWORD")
     subdomain = os.environ.get("EDUPAGE_SUBDOMAIN")
 
     if username and password and subdomain:
+        subdomains = [s.strip() for s in subdomain.split(",") if s.strip()]
         api = _get_edupage_api()
-        edu = api.Edupage()
-        try:
-            edu.login(username, password, subdomain)
-            _session = edu
-            logger.info("Auto-logged in as %s on %s", username, subdomain)
-        except Exception as e:
-            logger.warning("Auto-login failed: %s", e)
+        for sub in subdomains:
+            edu = api.Edupage()
+            try:
+                edu.login(username, password, sub)
+                _sessions[sub] = edu
+                logger.info("Auto-logged in as %s on %s", username, sub)
+            except Exception as e:
+                logger.warning("Auto-login failed for %s: %s", sub, e)
     elif username and password:
         api = _get_edupage_api()
         edu = api.Edupage()
         try:
             edu.login_auto(username, password)
-            _session = edu
-            logger.info("Auto-logged in as %s via portal", username)
+            sub = getattr(edu, "subdomain", None) or "auto"
+            _sessions[sub] = edu
+            logger.info("Auto-logged in as %s via portal (%s)", username, sub)
         except Exception as e:
             logger.warning("Auto-login via portal failed: %s", e)
 
