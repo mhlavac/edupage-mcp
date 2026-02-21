@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "edupage": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", ".", "python", "-m", "edupage_mcp"],
+      "env": {
+        "EDUPAGE_USERNAME": "${EDUPAGE_USERNAME}",
+        "EDUPAGE_PASSWORD": "${EDUPAGE_PASSWORD}",
+        "EDUPAGE_SUBDOMAIN": "${EDUPAGE_SUBDOMAIN}"
+      }
+    }
+  }
+}
