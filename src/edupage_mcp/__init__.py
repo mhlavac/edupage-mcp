@@ -1,3 +1,3 @@
-from edupage_mcp.server import main
+from edupage_mcp.app import main
 
 __all__ = ["main"]

@@ -99,8 +99,9 @@ The subdomain is the part before `.edupage.org` in your school's URL (e.g. `mysc
 | `get_periods` | Get bell schedule / periods |
 | `get_my_children` | Get children linked to a parent account |
 | `get_absences` | Get student absences |
-| `get_upcoming_events` | Get upcoming school events |
+| `get_upcoming_events` | Get upcoming school events (filters on the real event date parsed from the title, not the post date) |
 | `get_student_summary` | All-in-one summary: grades, homework, exams, absences |
+| `get_school_days` | Per-date "is the kid at school over lunch?" view fusing trips, excursions, and absences (⚠️ holidays NOT covered) |
 
 ## Project Structure
 
@@ -143,6 +144,18 @@ npx @modelcontextprotocol/inspector uv run python -m edupage_mcp
 - Session persists for the lifetime of the server process
 - The `send_message` tool sends real messages — use with care
 - If Edupage requests a CAPTCHA, log in via browser first then retry
+- **Event dates vs. post dates:** Edupage "event" timeline items store the
+  *post* date (when the announcement was published) in their `timestamp`; the
+  real event date lives in the title (e.g. `Udalosť: Sternwarte -  17.06.2026`).
+  `get_upcoming_events` parses that title date and filters on it, so events
+  announced months ahead still surface. `get_timeline` / `get_notifications`
+  expose an opt-in `by_event_date` flag to apply their date range to the parsed
+  event date instead of the timestamp.
+- **`get_school_days` does NOT cover holidays.** It surfaces trips, excursions,
+  and absences only. Public / Brandenburg state holidays and school-closure
+  days are not reliably present in Edupage data, so undisrupted days come back
+  `in_school: null` (unknown), never `true`. Cross-check a public-holiday
+  source or the caterer's menu before assuming a child is at school.
 
 ## License
 
