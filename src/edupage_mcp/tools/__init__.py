@@ -1,12 +1,12 @@
 """Tool registration for Edupage MCP server."""
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..session import SessionManager
 from . import academics, auth, calendar, events, people, school, timeline, timetable
 
 
-def register_all(mcp: FastMCP, sessions: SessionManager) -> None:
+def register_all(mcp: MCPServer, sessions: SessionManager) -> None:
     """Register all MCP tools on the given server instance."""
     auth.register(mcp, sessions)
     timetable.register(mcp, sessions)

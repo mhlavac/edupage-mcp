@@ -1,11 +1,11 @@
 """Authentication tools — login, login_auto."""
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..session import SessionManager
 
 
-def register(mcp: FastMCP, sessions: SessionManager) -> None:
+def register(mcp: MCPServer, sessions: SessionManager) -> None:
     @mcp.tool()
     def login(username: str = "", password: str = "", subdomain: str = "") -> str:
         """

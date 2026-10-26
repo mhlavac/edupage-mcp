@@ -3,7 +3,7 @@
 from datetime import date, timedelta
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..errors import handle_errors
 from ..filters import filter_timeline_events
@@ -11,7 +11,7 @@ from ..serializers import extract_assignment_fields, extract_homework_fields, le
 from ..session import SessionManager
 
 
-def register(mcp: FastMCP, sessions: SessionManager) -> None:
+def register(mcp: MCPServer, sessions: SessionManager) -> None:
 
     @mcp.tool()
     @handle_errors("get_grades")

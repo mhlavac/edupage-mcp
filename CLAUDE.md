@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-MCP server that connects Claude to Edupage — a school information system used across Europe. Modular Python package (`src/edupage_mcp/`) exposing ~25 tools via the FastMCP framework. Built on top of the `edupage-api` library.
+MCP server that connects Claude to Edupage — a school information system used across Europe. Modular Python package (`src/edupage_mcp/`) exposing ~25 tools via the MCP SDK v2 `MCPServer` (formerly FastMCP). Built on top of the `edupage-api` library.
 
 ## Development Commands
 
@@ -30,7 +30,7 @@ The package is structured as focused modules under `src/edupage_mcp/`:
 src/edupage_mcp/
 ├── __init__.py          # re-export main()
 ├── __main__.py          # python -m entry
-├── app.py               # FastMCP creation, auto-login, main()
+├── app.py               # MCPServer creation, auto-login, main()
 ├── session.py           # SessionManager class
 ├── serializers.py       # lean_* + serialize + to_json
 ├── errors.py            # handle_errors, _ERROR_HINTS, error()
@@ -84,8 +84,8 @@ Tests live in `tests/` covering the pure modules (`errors`, `serializers`, `filt
 
 ## Dependencies
 
-- `mcp` >= 1.2.0 — MCP Python SDK (FastMCP)
-- `edupage-api` >= 0.12.3 — Unofficial Edupage API client
+- `mcp` >= 2.3.0 — MCP Python SDK v2 (`mcp.server.mcpserver.MCPServer`)
+- `edupage-api` >= 0.13.3 — Unofficial Edupage API client
 - `pytest` (dev) — Test runner
 
 ## Auth Configuration

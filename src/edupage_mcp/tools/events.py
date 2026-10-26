@@ -2,7 +2,7 @@
 
 from datetime import date, datetime, timedelta
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..dates import extract_event_date
 from ..errors import error, handle_errors
@@ -20,7 +20,7 @@ from ..serializers import (
 from ..session import SessionManager
 
 
-def register(mcp: FastMCP, sessions: SessionManager) -> None:
+def register(mcp: MCPServer, sessions: SessionManager) -> None:
 
     @mcp.tool()
     @handle_errors("get_absences")

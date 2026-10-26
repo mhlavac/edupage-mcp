@@ -1,13 +1,13 @@
 """People tools — get_my_children, get_students, get_all_students, get_teachers."""
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..errors import handle_errors
 from ..serializers import lean_json, lean_student, lean_teacher
 from ..session import SessionManager
 
 
-def register(mcp: FastMCP, sessions: SessionManager) -> None:
+def register(mcp: MCPServer, sessions: SessionManager) -> None:
 
     @mcp.tool()
     @handle_errors("get_my_children")

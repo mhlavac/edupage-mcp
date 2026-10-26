@@ -2,7 +2,7 @@
 
 from datetime import date, datetime, timedelta
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..errors import handle_errors
 from ..filters import filter_timeline_events
@@ -10,7 +10,7 @@ from ..serializers import lean_json, lean_timeline_event
 from ..session import SessionManager
 
 
-def register(mcp: FastMCP, sessions: SessionManager) -> None:
+def register(mcp: MCPServer, sessions: SessionManager) -> None:
 
     @mcp.tool()
     @handle_errors("get_timeline")

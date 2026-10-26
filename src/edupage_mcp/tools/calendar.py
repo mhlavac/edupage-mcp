@@ -14,7 +14,7 @@ holiday source / the caterer's menu to be sure.
 import re
 from datetime import date, datetime, timedelta
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..dates import extract_event_date
 from ..errors import error
@@ -98,7 +98,7 @@ def _classify(event) -> str | None:
     return None
 
 
-def register(mcp: FastMCP, sessions: SessionManager) -> None:
+def register(mcp: MCPServer, sessions: SessionManager) -> None:
 
     @mcp.tool()
     def get_school_days(

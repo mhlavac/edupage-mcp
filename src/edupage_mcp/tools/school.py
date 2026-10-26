@@ -4,7 +4,7 @@ import logging
 from datetime import date, datetime
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..errors import error, handle_errors
 from ..serializers import lean_class, lean_classroom, lean_json, lean_subject, serialize
@@ -13,7 +13,7 @@ from ..session import SessionManager
 logger = logging.getLogger(__name__)
 
 
-def register(mcp: FastMCP, sessions: SessionManager) -> None:
+def register(mcp: MCPServer, sessions: SessionManager) -> None:
 
     @mcp.tool()
     @handle_errors("get_classes")

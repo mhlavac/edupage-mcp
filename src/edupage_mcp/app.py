@@ -3,12 +3,12 @@
 import logging
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .session import SessionManager
 from .tools import register_all
 
-mcp = FastMCP(
+mcp = MCPServer(
     "Edupage",
     instructions=(
         "MCP server for Edupage — a school information system. "

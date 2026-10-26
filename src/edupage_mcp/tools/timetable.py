@@ -4,7 +4,7 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ..errors import error, handle_errors
 from ..resolvers import resolve_class_for_student_across_sessions
@@ -14,7 +14,7 @@ from ..session import SessionManager
 logger = logging.getLogger(__name__)
 
 
-def register(mcp: FastMCP, sessions: SessionManager) -> None:
+def register(mcp: MCPServer, sessions: SessionManager) -> None:
 
     def _get_timetable_by_class(edu: Any, class_name: str, target_date: date) -> str:
         """Fetch timetable for a specific class by name."""

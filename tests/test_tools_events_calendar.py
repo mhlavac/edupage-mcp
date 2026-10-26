@@ -1,6 +1,6 @@
 """Tests for the get_upcoming_events fix and the get_school_days tool.
 
-These exercise the registered tool callables directly (no FastMCP transport,
+These exercise the registered tool callables directly (no MCPServer transport,
 no real Edupage API). A fake Edupage instance backs a single-school
 SessionManager and returns synthetic SimpleNamespace timeline events.
 """
@@ -9,7 +9,7 @@ import json
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from edupage_mcp.session import SessionManager
 from edupage_mcp.tools import calendar as calendar_tools
@@ -57,7 +57,7 @@ def _single_school_sessions(edu):
 
 def _register_tool(register_fn, sessions):
     """Register a tool module and return {name: callable} of its tools."""
-    mcp = FastMCP("test")
+    mcp = MCPServer("test")
     register_fn(mcp, sessions)
     return {name: t.fn for name, t in mcp._tool_manager._tools.items()}
 
